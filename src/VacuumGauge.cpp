@@ -81,6 +81,16 @@ static const float kTorrThreshold = 10.0f;
 static const float kTrendKnee       = 50000.0f;
 static const float kMicronsPerCount = 45.7f;
 
+// Absolute pressure floor (Torr). Reported/displayed pressure is clamped here so
+// a negative zero-offset or near-vacuum sensor noise can never show as negative.
+static const float kMinPressure     = 0.0f;
+
+// Bounds on the user zero-offset trims (symmetric about zero), so repeated
+// button presses - or out-of-range serial command values - can't drive the
+// calibration into nonsense.
+static const int kMaxOffsetTorr     = 700;    // +/- Torr  (coarse trim)
+static const int kMaxOffsetmTorr    = 10000;   // +/- mTorr (fine trim)
+
 const char *Version = "Vacuum Gauge, version 1.0 Feb 3, 2024";
 
 // ---------------------------------------------------------------------------
@@ -98,6 +108,7 @@ typedef struct
   int           rawTemp;         // Last raw temperature counts   (live)
   int           offsetTorr;      // Coarse zero offset, Torr
   int           offsetmTorr;     // Fine zero offset, mTorr
+  int           useCalTable;     // 0 = factory micron formula, 1 = PWL cal table
 } Data;
 
 Data data =
@@ -105,7 +116,8 @@ Data data =
   sizeof(Data), "Press", 1,
   0x50,
   0, 0, 0,
-  0, 0
+  0, 0,
+  0                              // useCalTable: default to factory formula
 };
 
 // Snapshot of the last values written to flash, used to detect changes.
@@ -162,6 +174,7 @@ Command cmds[] =
   {"GRTEMP",   CMDint,      0,  (void *)&data.rawTemp,       NULL, "Return raw temp sensor data"},
   {"?TOFFSET", CMDint,     -1,  (void *)&data.offsetTorr,    NULL, "Set/return Torr offset"},
   {"?MTOFFSET",CMDint,     -1,  (void *)&data.offsetmTorr,   NULL, "Set/return milli-Torr offset"},
+  {"?CALMODE", CMDint,     -1,  (void *)&data.useCalTable,   NULL, "Calibration mode: 0=factory formula, 1=PWL table"},
   {NULL}
 };
 static CommandList cmdList = {cmds, NULL};
@@ -180,15 +193,22 @@ static bool settingsChanged(void)
 {
   return data.offsetTorr  != lastSaved.offsetTorr  ||
          data.offsetmTorr != lastSaved.offsetmTorr ||
+         data.useCalTable != lastSaved.useCalTable ||
          data.TWIadd      != lastSaved.TWIadd      ||
          data.Rev         != lastSaved.Rev         ||
          strncmp(data.Name, lastSaved.Name, sizeof(data.Name)) != 0;
 }
 
-// Debug command: report whether settings have changed since the last save.
+// Debug command: report the latest raw pressure count.
+//
+// NOTE: cp.println() has no String overload - passing an Arduino String (e.g.
+// "Raw data: " + String(data.rawData)) silently converts to bool and prints
+// "TRUE". Use the typed print()/println() overloads instead.
 void Debug(void)
 {
-  cp.println(settingsChanged() ? "Changed since last save" : "No change");
+  cp.print("Raw data: ");
+  cp.println(data.rawData);   // println(int)
+//  cp.println(settingsChanged() ? "Changed since last save" : "No change");
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +286,61 @@ void displayPressure(float pressure)
 }
 
 // ---------------------------------------------------------------------------
+// Piece-wise linear (PWL) calibration table
+//
+// Maps the raw sensor reading (data.rawData) to pressure in Torr by linear
+// interpolation between measured calibration points. This is an OPTIONAL
+// alternative to the factory micron formula, selected by data.useCalTable
+// (see the ?CALMODE command).
+//
+// Points MUST be sorted by ASCENDING raw value. Note that pressure DECREASES as
+// the raw count increases. This is the factory-supplied default table; a future
+// user-calibration routine can overwrite these points and persist them.
+// ---------------------------------------------------------------------------
+
+typedef struct
+{
+  int   raw;     // Raw sensor count (as returned in data.rawData / GRPRES)
+  float torr;    // Corresponding pressure, Torr
+} CalPoint;
+
+static const CalPoint calTable[] =
+{
+  {18836, 760.00f},
+  {21012, 28.90f},
+  {21916, 18.70f},
+  {24386,  8.57f},
+  {25868,  5.94f},
+  {27390,  4.14f},
+  {28354,  3.39f},
+  {29279,  2.77f},
+  {30015,  2.38f},
+  {30556,  2.08f},
+  {30777,  1.97f},
+  {31484,  1.70f},
+};
+static const int calTableSize = sizeof(calTable) / sizeof(calTable[0]);
+
+// Interpolate pressure (Torr) from a raw sensor count using calTable. Readings
+// outside the calibrated range are EXTRAPOLATED along the slope of the nearest
+// end segment rather than clamped, so the gauge stays responsive just beyond the
+// table. (Extrapolation is a straight-line guess; the wider you go, the larger
+// the error - add calibration points to extend the trustworthy range. A negative
+// extrapolated result is floored later by the kMinPressure clamp.)
+static float pwlPressure(int raw)
+{
+  // Find the segment [i-1, i] to use. Interior readings land in their bracketing
+  // segment; readings below the first point reuse the first segment and those
+  // above the last point reuse the last segment - both then extrapolate.
+  int i = 1;
+  while(i < calTableSize - 1 && raw >= calTable[i].raw) i++;
+
+  float r0 = calTable[i - 1].raw,  r1 = calTable[i].raw;
+  float p0 = calTable[i - 1].torr, p1 = calTable[i].torr;
+  return p0 + (p1 - p0) * ((float)(raw - r0) / (r1 - r0));
+}
+
+// ---------------------------------------------------------------------------
 // Sensor reading (periodic task)
 // ---------------------------------------------------------------------------
 
@@ -306,17 +381,33 @@ bool readPressure(void *)
   Wire.endTransmission(true);
   readSensorWord(data.rawData, data.rawTemp);
 
-  // Convert sensor counts to Torr.
-  //   0..50000        : counts are microns directly.
-  //   50000..65535    : trend-only region, ~45.7 microns per count above the knee.
-  float fval = press;
-  if(fval > kTrendKnee)
-    fval = kTrendKnee + (fval - kTrendKnee) * kMicronsPerCount;
-  fval = fval / 1000.0f;   // microns -> Torr (1 Torr = 1000 microns)
+  // Convert sensor counts to Torr, using either the optional PWL calibration
+  // table or the factory formula.
+  float fval;
+  if(data.useCalTable)
+  {
+    // Optional calibration: interpolate pressure from the raw count.
+    fval = pwlPressure(data.rawData);
+  }
+  else
+  {
+    // Factory conversion:
+    //   0..50000      : counts are microns directly.
+    //   50000..65535  : trend-only region, ~45.7 microns per count above the knee.
+    fval = press;
+    if(fval > kTrendKnee)
+      fval = kTrendKnee + (fval - kTrendKnee) * kMicronsPerCount;
+    fval = fval / 1000.0f;   // microns -> Torr (1 Torr = 1000 microns)
+  }
 
   // Apply the appropriate user zero offset.
   if(fval > kTorrThreshold) fval += data.offsetTorr;
   else                      fval += (float)data.offsetmTorr / 1000.0f;
+
+  // Absolute pressure can never be negative. A large negative zero-offset (or
+  // sensor noise near full vacuum) can drive the computed value below zero, so
+  // clamp to the physical floor before reporting/displaying it.
+  if(fval < kMinPressure) fval = kMinPressure;
 
   data.calPress = (double)fval;
   displayPressure(fval);
@@ -384,6 +475,12 @@ void loop()
   cp.processStreams();
   cp.processCommands();
 
+  // Sample both buttons once per loop. The Button library's pressed() only
+  // inspects the snapshot taken by read(); without these calls the debounced
+  // state never updates and pressed() can never return true.
+  buttonA.read();
+  buttonB.read();
+
   // Button A nudges the zero offset up; Button B nudges it down. Which trim is
   // adjusted (coarse Torr vs fine mTorr) follows the current reading range.
   if(buttonA.pressed())
@@ -396,4 +493,9 @@ void loop()
     if(data.calPress > kTorrThreshold) data.offsetTorr--;
     else                               data.offsetmTorr -= 10;
   }
+
+  // Keep both trims within range no matter how they were changed (button press
+  // or ?TOFFSET / ?MTOFFSET serial command).
+  data.offsetTorr  = constrain(data.offsetTorr,  -kMaxOffsetTorr,  kMaxOffsetTorr);
+  data.offsetmTorr = constrain(data.offsetmTorr, -kMaxOffsetmTorr, kMaxOffsetmTorr);
 }

@@ -3,6 +3,12 @@
 
 #define GC9A01_DRIVER     // Configure all registers
 
+// On the ESP32-S3 the default port (FSPI) makes TFT_eSPI's SPI_PORT resolve to
+// 1, and REG_SPI_BASE(1) is 0 - so the driver writes to register address 0x10
+// and the firmware panics with a StoreProhibited fault during tft.init().
+// Selecting the HSPI port makes SPI_PORT resolve to 3 (a valid SPI3 base).
+#define USE_HSPI_PORT
+
 #define TFT_WIDTH  128
 #define TFT_HEIGHT 128
 

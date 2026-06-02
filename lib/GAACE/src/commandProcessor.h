@@ -324,9 +324,18 @@ public:
     void print(double val,   int fmt = 2);
     void print(uint8_t val,  int fmt = DEC);
 
+    /**
+     * Arduino String overload. Without this, print()/println() of a String
+     * matches print(bool) via String's implicit safe-bool conversion and
+     * silently prints "TRUE"/"FALSE" instead of the text. The exact-match
+     * reference overload takes precedence over that conversion.
+     */
+    void print(const String &val)  { print(val.c_str()); }
+
     /** println variants: print value then call print() for the newline. */
     void println(char *val)         { print(val);      print(); }
     void println(const char *val)   { print(val);      print(); }
+    void println(const String &val) { print(val);      print(); }
     void println(bool val)          { print(val);      print(); }
     void println(int val,      int fmt = DEC) { print(val, fmt); print(); }
     void println(uint32_t val, int fmt = DEC) { print(val, fmt); print(); }
