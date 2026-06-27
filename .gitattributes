@@ -1,0 +1,2 @@
+releases/*.bin binary
+releases/*.bin -delta

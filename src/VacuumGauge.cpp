@@ -45,6 +45,7 @@
 #include <arduino-timer.h>
 
 #include "VacuumGauge.h"
+#include "build_info.h"
 
 // ---------------------------------------------------------------------------
 // Configuration constants
@@ -112,7 +113,7 @@ static const int kCalAvgSamples = 8;
 // usual default of TCP-to-virtual-COM bridges).
 static const int kDefaultTcpPort = 23;
 
-const char *Version = "Vacuum Gauge, version 1.0 Feb 3, 2024";
+const char *Version = "Vacuum Gauge, version " FIRMWARE_VERSION "_" BUILD_TIMESTAMP;
 
 // ---------------------------------------------------------------------------
 // Persistent data structure
